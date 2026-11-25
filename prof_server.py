@@ -503,6 +503,9 @@ class Brain:
         self.proc = None
         self.pending = []            # gens en attente de leur "result", dans l'ordre
         self.req = 0
+        self.ctx_tokens = 0          # taille du contexte au dernier appel du modèle (jetons)
+        self.handover_task = None    # passation en cours d'écriture (copie de la conversation, en parallèle)
+        self.handover_ready = None   # texte de la passation, prêt pour la bascule
 
     @property
     def fresh(self):
@@ -671,6 +674,10 @@ class Brain:
             elif ty == "stream_event":
                 ev = j["event"]
                 et = ev.get("type")
+                if et == "message_start":
+                    u = ev.get("message", {}).get("usage", {})
+                    self.ctx_tokens = sum(u.get(k) or 0 for k in
+                                          ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
                 if et == "content_block_start":
                     cb = ev.get("content_block", {})
                     if cb.get("type") == "tool_use":
@@ -706,10 +713,79 @@ class Brain:
                     self.pending.pop(0)
                 await self.on_event("result", gen, j)
         log("claude s'est arrêté, code", await proc.wait())
+        if self.proc is not proc:       # ancien processus (bascule) : la file appartient au nouveau
+            return
         for g in self.pending:
             await self.on_event("result", g, {"subtype": "process_exit"})
         self.pending = []
 
+
+    # --- bascule : une conversation trop longue est résumée, puis une séance neuve reprend ---
+    # Le contexte grossit à chaque tour (dessins, cartes, discussion : 735 000 jetons sur la séance de robotique du
+    # 2026-11-25). Au-delà de ROTATE_TOKENS, une COPIE de la conversation (--fork-session, rien d'enregistré)
+    # écrit la passation en parallèle, sans bloquer le prof ; à la question suivante, le prof repart d'une
+    # séance neuve qui reçoit cette passation, l'état du tableau et les échanges faits pendant l'écriture.
+    ROTATE_TOKENS = int(os.environ.get("PROF_ROTATE_TOKENS", "250000"))
+    HANDOVER = (
+        "[Note du système, pas de l'élève. Ta conversation est devenue trop longue : une séance neuve va prendre "
+        "le relais, et elle ne saura que ce que tu écris maintenant (plus la liste des cartes du tableau). Écris la "
+        "passation en Markdown, rien avant ni après, sans LaTeX inutile, 800 à 1500 mots, avec ces sections :\n"
+        "## Ce qu'il attend : le contrat d'apprentissage et toutes les préférences qu'il a exprimées (modes, "
+        "rythme, format des réponses, des schémas, ce qu'il n'aime pas), avec ses mots quand c'est possible ; "
+        "reprends celles de la passation précédente si tu en as reçu une.\n"
+        "## Où on en est : les notions vues dans l'ordre ; pour chacune, compris, fragile ou pas vu, et ses erreurs.\n"
+        "## En cours : la question ou l'exercice en cours, ce qui reste à faire, ce que tu allais dire ensuite.\n"
+        "## Tableau : les cartes utiles (id, ce qu'elle montre, ses étapes et encadrés) et les notations adoptées.\n"
+        "## À ne pas refaire : ce qui n'a pas marché avec lui.]")
+
+    def want_handover(self):
+        return (self.engine == "claude" and self.ctx_tokens > self.ROTATE_TOKENS and self.meta.get("session_id")
+                and not self.handover_task and not self.handover_ready)
+
+    async def handover(self):
+        sid, t = self.meta["session_id"], time.time()
+        log(f"contexte du prof : {self.ctx_tokens} jetons > {self.ROTATE_TOKENS}, passation en cours d'écriture")
+        try:
+            p = await asyncio.create_subprocess_exec(
+                self.exe, "-p", "--resume", sid, "--fork-session", "--no-session-persistence", "--tools", "",
+                "--setting-sources", "user", "--model", self.model, "--output-format", "json",
+                cwd=self.dir, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+            out, err = await asyncio.wait_for(p.communicate(self.HANDOVER.encode()), 600)
+            text = json.loads(out).get("result", "").strip()
+        except Exception as e:
+            log("passation ratée :", repr(e)[:200])
+            self.handover_task = None
+            return
+        if len(text) < 300:
+            log("passation ratée (trop courte) :", text[:200], err.decode(errors="replace")[:200])
+            self.handover_task = None
+            return
+        f = self.dir / "passation.md"
+        if f.exists():
+            f.replace(self.dir / "passation.prev.md")
+        f.write_text(f"<!-- écrite le {time.strftime('%Y-%m-%d %H:%M')} par la séance {sid}, à {self.ctx_tokens} jetons -->\n" + text)
+        self.handover_ready = text
+        log(f"passation prête ({len(text)} caractères, {time.time() - t:.0f} s) : bascule à la prochaine question")
+
+    async def rotate(self):
+        """Ferme la conversation actuelle ; la prochaine question ouvre une séance neuve. Renvoie la passation."""
+        text, self.handover_ready, self.handover_task = self.handover_ready, None, None
+        proc = self.proc
+        await self.stop()
+        if proc:
+            try:
+                await asyncio.wait_for(proc.wait(), 10)
+            except asyncio.TimeoutError:
+                proc.kill()
+        old = self.meta.pop("session_id", None)
+        self.meta.setdefault("old_sessions", []).append(old)
+        self.meta.pop("prompt_sections", None)
+        self.meta_f.write_text(json.dumps(self.meta))
+        self.ctx_tokens = 0
+        await self.start()
+        log("bascule : séance", old, "fermée, la suite part d'une séance neuve")
+        return text
 
 
 class CodexBrain(Brain):
@@ -968,6 +1044,8 @@ class Prof:
         self.t = {"t0": t0 or time.time(), "stt": t_stt or time.time()}
         await self.send({"t": "gen", "gen": self.gen})
         msg = prefix + text
+        if self.brain.handover_ready:   # conversation trop longue : séance neuve, avec la passation
+            msg = await self.reprise() + msg
         if self.brain.prompt_notice:    # consignes mises à jour depuis le début de la séance
             msg = self.brain.prompt_notice + "\n" + msg
             self.brain.prompt_notice_sent()
@@ -1179,11 +1257,33 @@ class Prof:
         short = f"{sel['id']}" + (f" ligne {sel['ligne']}" if sel.get("ligne") else "")
         return f"[L'élève montre au tableau : {where}, {what}]\n", short
 
+    async def board_state(self):
+        p = await asyncio.create_subprocess_exec("python3", str(CAHIER), "state", self.a.slug,
+                                                 stdout=asyncio.subprocess.PIPE)
+        return (await p.communicate())[0].decode().strip()
+
+    def maybe_handover(self):
+        if self.brain.want_handover():
+            self.handover_mark = len(self.history)
+            self.brain.handover_task = asyncio.create_task(self.brain.handover())
+
+    async def reprise(self):
+        """Bascule vers une séance neuve : le début de son premier message (passation, tableau, échanges récents)."""
+        since = self.history[getattr(self, "handover_mark", len(self.history)):]
+        text = await self.brain.rotate()
+        board = await self.board_state()
+        since = "\n".join(f"{qui} : {t}" for qui, t in since[-30:])
+        await self.send({"t": "tool", "text": "conversation résumée : le prof repart d'une séance neuve"})
+        return ("[Note du système : ta conversation précédente avec l'élève devenait trop longue, tu repars d'une "
+                "séance neuve. Voici la passation que tu as écrite à la fin de la précédente (elle fait foi pour ses "
+                "attentes et où on en est) :\n\n" + text + "\n\n" +
+                (f"Tableau actuel :\n{board}\n\n" if board else "") +
+                (f"Échanges après l'écriture de la passation (le début peut la recouper) :\n{since}\n\n" if since else "") +
+                "Continue le cours là où il en est, sans parler de cette bascule à l'élève. Sa question suit.]\n")
+
     async def kickoff(self):
         if self.brain.fresh:
-            p = await asyncio.create_subprocess_exec("python3", str(CAHIER), "state", self.a.slug,
-                                                     stdout=asyncio.subprocess.PIPE)
-            board = (await p.communicate())[0].decode().strip()
+            board = await self.board_state()
             board = f" Le tableau contient déjà des cartes d'une séance précédente :\n{board}\n" if "\t" in board else ""
             await self.question(f"[Séance : début du cours sur « {self.a.topic} ».{board} Salue-le en une phrase, "
                                 "puis demande-lui en une question ce qu'il sait déjà ou par où il veut commencer.]")
@@ -1393,6 +1493,7 @@ class Prof:
                 await self.queue_say(gen, s)
             await self.ttsq.put((gen, None, None, self.cues))
             self.cues = []
+            self.maybe_handover()
             if data.get("subtype") not in ("success", None):
                 log("fin de tour :", data.get("subtype"))
 

@@ -103,6 +103,7 @@ button.primary{background:var(--acc);color:#fff;border:0}
 </div>
     <button id="silentbtn" title="Touche S : pas de voix, pas de micro ; tu lis et tu écris">🔊 Voix (S)</button>
     <div style="display:flex;gap:6px"><button id="rew" title="Reprendre la phrase ; 2 appuis rapides : la précédente (flèche gauche : la partie, voir Suite)">⏮ Phrase</button>
+    <button id="skip" title="Flèche droite : sauter la phrase en cours ; 2 appuis rapides : jusqu'à la partie suivante">⏭ Phrase</button>
     <button id="pause" title="Touche P">⏸ Pause</button></div>
     <span id="micinfo"></span>
     <span id="lat"></span>
@@ -208,7 +209,8 @@ function startHold(it) {
 function releaseHold() { if (!hold) return; const it = hold.it; clearHold(); it.released = true; playNext(); }
 function holdKey() {                          // → ou bouton : fige le compte à rebours, ou passe à la suite
   if (!hold) return false;
-  if (!hold.frozen) { hold.frozen = true; clearInterval(hold.timer); holdUI(); }
+  // en train de sauter (→ répétés) : la partie suivante démarre tout de suite, sans « figer »
+  if (!hold.frozen && performance.now() - lastSkip > 1500) { hold.frozen = true; clearInterval(hold.timer); holdUI(); }
   else releaseHold();
   return true;
 }
@@ -315,6 +317,29 @@ function partBack() {
   if (now - lastPartBack < 1500 || (playing && heard.length - 1 === starts[n] && now - cur.t0 < 1200)) n -= 1;
   lastPartBack = now;
   replayFrom(starts[Math.max(0, n)], true);
+}
+// → hors attente (ou ⏭) : saute la phrase en cours ; appui rapide suivant : saute jusqu'à la prochaine partie
+// (phrase qui change l'affichage). Les repères des phrases sautées sont quand même exécutés : le tableau
+// arrive dans le même état que si on les avait écoutées.
+let lastSkip = -Infinity;
+function skipAhead() {
+  if (!playing && !queue.length) return false;
+  const now = performance.now(), toPart = now - lastSkip < 1500;
+  lastSkip = now;
+  const skip = it => {
+    heard.push(it); pruneHeard();
+    for (const c of it.cues || []) { const ids = cueCards(c); if (ids.length) curCard = ids[ids.length - 1]; }
+    if (it.cues && it.cues.length) send({t: "cue", cues: it.cues, idx: it.idx});
+    send({t: "played", gen: it.gen, idx: it.idx});
+  };
+  if (cur) { const it = cur; silentStop(); send({t: "played", gen: it.gen, idx: it.idx}); }
+  if (toPart) {
+    clearHold();
+    while (queue.length && !(queue[0].cues || []).some(c => HOLD_CUE.test(c) && !/--clear/.test(c))) skip(queue.shift());
+    if (queue[0]) queue[0].released = true;
+  }
+  if (userPaused) setPaused(false); else playNext();
+  return true;
 }
 function setPaused(on) {
   userPaused = on;
@@ -818,6 +843,7 @@ function playSample(m) {
 }
 $("pause").onclick = () => setPaused(!userPaused);
 $("rew").onclick = rewind;
+$("skip").onclick = () => { if (!holdKey()) skipAhead(); };
 // --- mode silencieux (en cours, en bibliothèque…) : ni voix ni micro, mémorisé par board côté serveur ---
 let silent = false;
 { const c = document.querySelector("#cover p"); if (c) c.dataset.voice = c.innerHTML; }
@@ -986,7 +1012,7 @@ document.addEventListener("keydown", e => {
   if (e.key.toLowerCase() === "s" && plain) { e.preventDefault(); toggleSilent(); return; }
   if (e.key.toLowerCase() === "p" && plain) { e.preventDefault(); setPaused(!userPaused); return; }
   if (e.key === "ArrowLeft" && plain) { e.preventDefault(); partBack(); return; }
-  if (e.key === "ArrowRight" && plain) { if (holdKey()) e.preventDefault(); return; }
+  if (e.key === "ArrowRight" && plain) { if (holdKey() || skipAhead()) e.preventDefault(); return; }
   if (!micReady) return;
   if (e.code === "Space" && silent) {          // silencieux : espace mène au champ texte
     e.preventDefault(); $("bigtxt").focus();
