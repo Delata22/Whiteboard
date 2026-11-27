@@ -995,6 +995,10 @@ document.addEventListener("keydown", e => {
     document.execCommand("copy"); ta.remove(); done();
   });
 }, true);
+addEventListener("message", e => {               // QCM fini au tableau : le bilan part au prof
+  if (!e.data || typeof e.data.cahierQcm !== "string" || e.source !== $("board").contentWindow) return;
+  send({t: "qcm", summary: e.data.cahierQcm.slice(0, 4000), discuss: !!e.data.discuss});
+});
 addEventListener("message", e => {
   if (!e.data || !e.data.sceneError) return;
   sceneErrs.push({t: "scene_error", text: String(e.data.sceneError).slice(0, 400), scene: String(e.data.scene || "").slice(0, 120)});

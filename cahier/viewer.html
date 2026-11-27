@@ -85,6 +85,30 @@ iframe{width:100%;border:0;min-height:420px;background:transparent;border-radius
 .demo .shows>div{padding:6px 10px;border-left:3px solid transparent;opacity:.55}
 .demo .shows>div.cur{opacity:1;border-left-color:var(--acc)}
 .empty{color:var(--muted);padding:40px;text-align:center}
+.qcm .top{display:flex;align-items:center;gap:10px;font-size:14px;color:var(--muted);margin-bottom:6px}
+.qcm .top .sc{margin-left:auto;color:var(--fg);font-variant-numeric:tabular-nums}
+.qcm .bar{height:5px;border-radius:3px;background:var(--line);overflow:hidden;margin-bottom:12px}
+.qcm .bar i{display:block;height:100%;background:var(--acc);transition:width .3s}
+.qcm .clock{font-variant-numeric:tabular-nums;color:var(--acc)} .qcm .clock.low{color:#E24B4A;font-weight:600}
+.qcm .q{margin:4px 0 12px}
+.qcm .ch{display:flex;flex-direction:column;gap:8px}
+.qcm .ch button{display:flex;gap:12px;align-items:flex-start;text-align:left;font-size:inherit;padding:10px 14px;border-radius:10px;border:1.5px solid var(--line);background:var(--card)}
+.qcm .ch button:not(:disabled):hover{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 7%,var(--card))}
+.qcm .ch button b{min-width:1.4em;color:var(--acc)}
+.qcm .ch button.pick{border-color:var(--acc);background:var(--accbg)}
+.qcm .ch button.ok{border-color:#1D9E75;background:color-mix(in srgb,#1D9E75 16%,var(--card))}
+.qcm .ch button.ko{border-color:#E24B4A;background:color-mix(in srgb,#E24B4A 14%,var(--card))}
+.qcm .ch button.miss{border-style:dashed;border-color:#1D9E75}
+.qcm .ch button:disabled{cursor:default;color:var(--fg)}
+.qcm .fb{margin-top:12px;padding:8px 12px;border-radius:8px;background:var(--warn)}
+.qcm .fb.good{background:color-mix(in srgb,#1D9E75 14%,var(--card))}
+.qcm .act{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.qcm .act button{font-size:15px;padding:6px 14px}
+.qcm .act button.go{background:var(--acc);color:var(--bg);border-color:var(--acc);font-weight:500}
+.qcm .big{font-size:34px;font-weight:600;margin:4px 0}
+.qcm .err{border-top:1px solid var(--line);padding:8px 0}
+.qcm .err .m{color:var(--muted);font-size:14px}
+.qcm .hist{color:var(--muted);font-size:13px}
 .home a{display:block;padding:10px 14px;border:1px solid var(--line);border-radius:10px;margin:8px 0;color:var(--fg);text-decoration:none;background:var(--card)}
 </style>
 </head>
@@ -398,6 +422,8 @@ function cardEl(c) {
     const im = document.createElement("img"); im.src = `/files/${encodeURIComponent(slug)}/${encodeURIComponent(c.body)}`;
     im.alt = c.title; im.style.cssText = "max-width:100%;max-height:70vh;display:block;margin:auto;border-radius:8px";
     box.append(im);
+  } else if (c.kind === "qcm") {
+    qcm(c, box);
   } else if (c.kind === "schema") {
     box.innerHTML = c.body;
   } else {
@@ -407,8 +433,132 @@ function cardEl(c) {
   btn("Masquer", () => hide(c.id));
   btn("Fermer", () => close_(c.id));
   el.append(box);
-  if (c.kind !== "animation" && c.kind !== "demo") tex(box);
+  if (!["animation", "demo", "qcm"].includes(c.kind)) tex(box);
   return el;
+}
+
+// ---------- QCM : une question à la fois, correction immédiate, score enregistré ----------
+// carte {kind: "qcm", qcm: {questions: [{q, choices: [...], answer: k | [k, ...], why, notion}], chrono?, malus?}}
+// L'état d'un QCM en cours vit ici (survit aux rafraîchissements du tableau) ; chaque essai fini est enregistré
+// par le serveur du tableau (data.qcm_results) et le bilan part à la page du prof.
+const qrun = {};          // id -> {order, i, picks, res: [{k, picks, ok}], shown, deadline, timer, sent}
+const LET = "ABCDEFGH";
+const qAns = q => Array.isArray(q.answer) ? q.answer : [q.answer];
+function qcmScore(Q, res) {
+  const malus = +Q.malus || 0;
+  return res.reduce((s, r) => s + (r.ok ? 1 : r.picks.length ? -malus : 0), 0);
+}
+function qcmStart(c, order) {          // remet l'essai à zéro sur place (l'affichage garde une référence à r)
+  const r = qrun[c.id] || (qrun[c.id] = {});
+  if (r.timer) clearInterval(r.timer);
+  for (const k of Object.keys(r)) delete r[k];
+  Object.assign(r, {order: order || c.qcm.questions.map((_, k) => k), i: 0, picks: [], res: [], shown: false, t0: Date.now(), ct: c.t});
+}
+function qcm(c, box) {
+  const Q = c.qcm, qs = Q.questions;
+  if (!qrun[c.id] || qrun[c.id].ct !== c.t) { qcmStart(c); qrun[c.id].ct = c.t; }   // carte remplacée : on repart de zéro
+  const r = qrun[c.id];
+  box.className = "body qcm";
+  const draw = () => {
+    if (r.timer) { clearInterval(r.timer); r.timer = null; }
+    box.innerHTML = "";
+    if (r.i >= r.order.length) return qcmEnd(c, box, draw);
+    const k = r.order[r.i], q = qs[k], multi = qAns(q).length > 1, good = r.res.filter(x => x.ok).length;
+    const top = document.createElement("div"); top.className = "top";
+    top.innerHTML = `<span>Question ${r.i + 1} / ${r.order.length}</span>${multi ? "<span>· plusieurs réponses</span>" : ""}<span class="clock"></span><span class="sc"></span>`;
+    top.querySelector(".sc").textContent = `${good} bonne${good > 1 ? "s" : ""} sur ${r.res.length}`;
+    const bar = document.createElement("div"); bar.className = "bar"; bar.innerHTML = `<i style="width:${100 * r.i / r.order.length}%"></i>`;
+    const qe = document.createElement("div"); qe.className = "q"; qe.innerHTML = mathMd(q.q);
+    const ch = document.createElement("div"); ch.className = "ch";
+    const answer = (picks, timeout) => {
+      const ok = picks.length === qAns(q).length && picks.every(x => qAns(q).includes(x));
+      r.res.push({k, picks: [...picks], ok, timeout: !!timeout}); r.shown = true; draw();
+    };
+    q.choices.forEach((txt, j) => {
+      const b = document.createElement("button");
+      b.innerHTML = `<b>${LET[j]}</b><span></span>`; b.querySelector("span").innerHTML = mathMd(String(txt)).replace(/^<p>|<\/p>\s*$/g, "");
+      const done = r.shown ? r.res[r.res.length - 1] : null;
+      if (done) {
+        b.disabled = true;
+        if (qAns(q).includes(j)) b.classList.add(done.picks.includes(j) ? "ok" : "miss");
+        else if (done.picks.includes(j)) b.classList.add("ko");
+      } else {
+        if (r.picks.includes(j)) b.classList.add("pick");
+        b.onclick = () => {
+          if (!multi) return answer([j]);
+          r.picks = r.picks.includes(j) ? r.picks.filter(x => x !== j) : [...r.picks, j]; draw();
+        };
+      }
+      ch.append(b);
+    });
+    box.append(top, bar, qe, ch);
+    const act = document.createElement("div"); act.className = "act";
+    const button = (t, fn, go) => { const b = document.createElement("button"); b.textContent = t; b.onclick = fn; if (go) b.className = "go"; act.append(b); return b; };
+    if (r.shown) {
+      const done = r.res[r.res.length - 1];
+      const fb = document.createElement("div"); fb.className = "fb" + (done.ok ? " good" : "");
+      const right = qAns(q).map(j => LET[j]).join(", ");
+      fb.innerHTML = mathMd((done.ok ? "**Juste.** " : done.picks.length ? `**Faux** : la réponse est ${right}. ` : done.timeout ? `**Temps écoulé** : la réponse est ${right}. ` : `La réponse est ${right}. `) + (q.why || ""));
+      box.append(fb);
+      button(r.i + 1 < r.order.length ? "Question suivante →" : "Voir le score →", () => { r.i++; r.picks = []; r.shown = false; draw(); }, true);
+    } else {
+      if (multi) button("Valider", () => answer(r.picks), true).disabled = !r.picks.length;
+      button("Je ne sais pas", () => answer([]));
+      const sec = +Q.chrono || 0;
+      if (sec) {
+        if (!r.deadline || r.deadlineFor !== r.i) { r.deadline = Date.now() + sec * 1000; r.deadlineFor = r.i; }
+        const clock = top.querySelector(".clock");
+        const tick = () => {
+          const left = Math.ceil((r.deadline - Date.now()) / 1000);
+          if (!box.isConnected) { clearInterval(r.timer); r.timer = null; return; }
+          if (left <= 0) return answer(r.picks, true);
+          clock.textContent = `· ${left} s`; clock.classList.toggle("low", left <= 10);
+        };
+        tick(); r.timer = setInterval(tick, 250);
+      }
+    }
+    box.append(act);
+    tex(box);
+  };
+  draw();
+}
+function qcmEnd(c, box, draw) {
+  const Q = c.qcm, qs = Q.questions, r = qrun[c.id];
+  const n = r.res.length, good = r.res.filter(x => x.ok).length, score = qcmScore(Q, r.res);
+  const errs = r.res.filter(x => !x.ok);
+  const notions = {};
+  for (const x of r.res) { const t = qs[x.k].notion || "sans notion"; (notions[t] = notions[t] || [0, 0])[1]++; if (x.ok) notions[t][0]++; }
+  const fmt = js => js.length ? js.map(j => LET[j]).join(", ") : "rien";
+  const summary = `QCM « ${c.title} » (carte ${c.id}) : ${Math.round(score * 100) / 100}/${n}` + (+Q.malus ? ` (malus ${Q.malus} par réponse fausse)` : "")
+    + `, ${good} justes, en ${Math.round((Date.now() - r.t0) / 1000)} s.`
+    + (Object.keys(notions).length > 1 ? " Par notion : " + Object.entries(notions).map(([t, [a, b]]) => `${t} ${a}/${b}`).join(", ") + "." : "")
+    + (errs.length ? " Erreurs : " + errs.map(x => `Q${qs[x.k] ? x.k + 1 : "?"} (« ${qs[x.k].q.slice(0, 90)} ») a répondu ${fmt(x.picks)}, attendu ${fmt(qAns(qs[x.k]))}`).join(" ; ") + "." : " Aucune erreur.");
+  if (!r.sent && n) {
+    r.sent = true;
+    const attempt = {t: Date.now() / 1000, score, n, good, total: qs.length, errors: errs.map(x => ({q: x.k, picks: x.picks})), secs: Math.round((Date.now() - r.t0) / 1000)};
+    fetch(`/api/s/${slug}/qcm`, {method: "POST", body: JSON.stringify({id: c.id, attempt})}).catch(() => {});
+    data.qcm_results = data.qcm_results || {}; (data.qcm_results[c.id] = data.qcm_results[c.id] || []).push(attempt);
+    if (parent !== window) parent.postMessage({cahierQcm: summary}, "*");
+  }
+  const pct = n ? Math.round(100 * Math.max(0, score) / n) : 0;
+  box.innerHTML = `<div class="top"><span>Résultat</span></div><div class="big"></div><div class="hist"></div><div class="nt"></div><div class="act"></div><div class="errs"></div>`;
+  box.querySelector(".big").textContent = `${Math.round(score * 100) / 100} / ${n}  ·  ${pct} %`;
+  const hist = ((data.qcm_results || {})[c.id] || []).map(a => `${Math.round(a.score * 100) / 100}/${a.n}`);
+  if (hist.length > 1) box.querySelector(".hist").textContent = "Tes essais : " + hist.join(" → ");
+  if (Object.keys(notions).length > 1) box.querySelector(".nt").textContent = "Par notion : " + Object.entries(notions).map(([t, [a, b]]) => `${t} ${a}/${b}`).join(" · ");
+  const act = box.querySelector(".act");
+  const button = (t, fn, go) => { const b = document.createElement("button"); b.textContent = t; b.onclick = fn; if (go) b.className = "go"; act.append(b); };
+  if (parent !== window) button("En parler avec le prof", e => { parent.postMessage({cahierQcm: summary, discuss: true}, "*"); e.target.disabled = true; e.target.textContent = "Envoyé au prof"; }, true);
+  if (errs.length) button(`Refaire les ${errs.length} erreur${errs.length > 1 ? "s" : ""}`, () => { qcmStart(c, errs.map(x => x.k)); draw(); });
+  button("Recommencer tout", () => { qcmStart(c); draw(); });
+  const el = box.querySelector(".errs");
+  for (const x of errs) {
+    const q = qs[x.k], d = document.createElement("div"); d.className = "err";
+    d.innerHTML = mathMd(`**Q${x.k + 1}.** ${q.q}`) + `<div class="m"></div>` + mathMd(q.why || "");
+    d.querySelector(".m").innerHTML = mathMd(`Ta réponse : ${x.picks.map(j => `${LET[j]} (${q.choices[j]})`).join(", ") || "aucune"} · attendu : ${qAns(q).map(j => `${LET[j]} (${q.choices[j]})`).join(", ")}`);
+    el.append(d);
+  }
+  tex(box);
 }
 
 const cache = {};   // cartes du centre, gardées vivantes (iframes, démo en cours)
@@ -417,9 +567,12 @@ function thumbEl(c) {
   const t = document.createElement("div"); t.className = "thumb"; t.title = c.title;
   t.innerHTML = `<div class="tt"><b></b><span></span></div><button class="x" title="Fermer">×</button>`;
   t.querySelector("b").textContent = c.id; t.querySelector("span").textContent = c.title;
-  if (c.kind === "animation" || c.kind === "demo") {
+  if (c.kind === "animation" || c.kind === "demo" || c.kind === "qcm") {
     const ph = document.createElement("div"); ph.className = "ph";
-    ph.textContent = c.kind === "demo" ? "Démo parlée" : "Animation"; t.append(ph);
+    const hist = ((data.qcm_results || {})[c.id] || []), last = hist[hist.length - 1];
+    ph.textContent = c.kind === "demo" ? "Démo parlée" : c.kind === "animation" ? "Animation"
+      : `QCM · ${c.qcm.questions.length} questions` + (last ? ` · dernier : ${Math.round(last.score * 100) / 100}/${last.n}` : "");
+    t.append(ph);
   } else {
     const m = document.createElement("div"); m.className = "mini";
     const light = {...c};
@@ -616,7 +769,7 @@ function render() {
 
   // la bande garde toutes les cartes ouvertes, celles au tableau comprises (surlignées) : rien ne disparaît puis revient
   const rest = [...st.pinned, ...main.filter(i => !st.pinned.includes(i))].filter(i => card(i));
-  const tk = rest.map(i => i + ":" + card(i).t + (main.includes(i) ? "*" : "")).join(",");
+  const tk = rest.map(i => i + ":" + card(i).t + (main.includes(i) ? "*" : "") + ((data.qcm_results || {})[i] || []).length).join(",");
   if (tk !== stripKey) {
     stripKey = tk;
     const strip = document.getElementById("strip"); strip.innerHTML = "";

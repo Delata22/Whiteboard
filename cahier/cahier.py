@@ -17,6 +17,9 @@ Commandes :
   cahier.py replay <slug> <id>             # relance une animation
   cahier.py add ... --kind image --file photo.jpg   # photo / capture (copiée dans le cahier)
   cahier.py add ... --kind demo            # démo parlée : JSON {"anim": html?, "steps": [{"say", "show", "pause"}]}
+  cahier.py add ... --kind qcm             # QCM cliquable : JSON {"questions": [{"q", "choices", "answer", "why", "notion"}],
+                                           #   "chrono": s par question ?, "malus": points retirés par réponse fausse ?}
+  cahier.py qcm <slug> [<id>]              # scores des QCM (chaque essai, erreurs)
   cahier.py play <slug> <id> [start|next|prev|repeat|pause]   # pilote une démo
   cahier.py selection <slug> [--clear]     # ce que l'élève a sélectionné au tableau
   cahier.py step <slug> <id> <k>          # amène une animation à son étape k (postMessage {step: k})
@@ -98,6 +101,43 @@ def sel_txt(st):
         return "sélection de l'élève : aucune"
     return (f"sélection de l'élève : carte {s['id']}" + (f", ligne {s['ligne']}" if s.get("ligne") else "")
             + (f" : formule (LaTeX : {s['tex']})" if s.get("tex") else f" : « {s['texte']} »"))
+
+
+def check_qcm(q):
+    """Refuse un QCM mal formé avant qu'il n'arrive au tableau (message lisible pour l'agent)."""
+    qs = q.get("questions") if isinstance(q, dict) else None
+    if not qs:
+        sys.exit('qcm : JSON {"questions": [{"q": "...", "choices": ["...", "..."], "answer": 0, "why": "...", "notion": "..."}]}')
+    for k, x in enumerate(qs, 1):
+        ch, ans = x.get("choices"), x.get("answer")
+        if not x.get("q") or not isinstance(ch, list) or not 2 <= len(ch) <= 8:
+            sys.exit(f"qcm : question {k} : il faut \"q\" et 2 à 8 \"choices\"")
+        ans = ans if isinstance(ans, list) else [ans]
+        if not ans or any(not isinstance(i, int) or not 0 <= i < len(ch) for i in ans):
+            sys.exit(f"qcm : question {k} : \"answer\" = indice (0 = 1er choix) ou liste d'indices, entre 0 et {len(ch) - 1}")
+    return q
+
+
+def qcm_txt(data, cid=None, short=False):
+    """Scores des QCM, lisibles par l'agent : chaque essai, et les erreurs du dernier."""
+    res, cards = data.get("qcm_results", {}), {c["id"]: c for c in data["cards"]}
+    out = []
+    for i, tries in res.items():
+        if cid and i != cid or i not in cards:
+            continue
+        sc = " → ".join(f"{round(t['score'], 2)}/{t['n']}" for t in tries)
+        out.append(f"QCM {i} « {cards[i]['title']} » : {len(tries)} essai(s) : {sc}")
+        if short or not tries:
+            continue
+        qs = cards[i]["qcm"]["questions"]
+        L = lambda js: ", ".join("ABCDEFGH"[j] for j in js) or "rien"
+        for e in tries[-1].get("errors", []):
+            q = qs[e["q"]] if e["q"] < len(qs) else {}
+            want = q.get("answer"); want = want if isinstance(want, list) else [want]
+            out.append(f"  erreur Q{e['q'] + 1} [{q.get('notion', '')}] « {q.get('q', '')[:100]} » : {L(e['picks'])} au lieu de {L(want)}")
+    if not out and not short:
+        out.append("aucun essai de QCM" + (f" pour {cid}" if cid else ""))
+    return out
 
 
 def server_up():
@@ -191,6 +231,14 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         # le viewer renvoie l'état quand l'utilisateur clique (épingler, retirer)
         p = self.path
+        if p.startswith("/api/s/") and p.endswith("/qcm"):     # un essai de QCM fini : on garde le score
+            slug = p[len("/api/s/"):-len("/qcm")]
+            n = int(self.headers.get("Content-Length", 0))
+            j = json.loads(self.rfile.read(n))
+            data = load(slug)
+            data.setdefault("qcm_results", {}).setdefault(str(j["id"]), []).append(j["attempt"])
+            save(slug, data)
+            return self.send(200, json.dumps({"version": data["version"]}))
         if p.startswith("/api/s/") and p.endswith("/state"):
             slug = p[len("/api/s/"):-len("/state")]
             n = int(self.headers.get("Content-Length", 0))
@@ -232,7 +280,7 @@ def main(argv=None, out=print):
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("new"); s.add_argument("slug"); s.add_argument("title")
     s = sub.add_parser("add"); s.add_argument("slug"); s.add_argument("id"); s.add_argument("title")
-    s.add_argument("--kind", default="text", choices=["text", "schema", "derivation", "animation", "demo", "image"])
+    s.add_argument("--kind", default="text", choices=["text", "schema", "derivation", "animation", "demo", "image", "qcm"])
     s.add_argument("--step", default=None); s.add_argument("--file", default=None)
     s.add_argument("--no-show", action="store_true", help="ne pas épingler la carte")
     for c in ("show", "pin", "unpin", "rm", "duo"):
@@ -250,6 +298,7 @@ def main(argv=None, out=print):
     s = sub.add_parser("selection"); s.add_argument("slug"); s.add_argument("--clear", action="store_true")
     s = sub.add_parser("step"); s.add_argument("slug"); s.add_argument("id"); s.add_argument("k", type=int)
     s = sub.add_parser("state"); s.add_argument("slug")
+    s = sub.add_parser("qcm"); s.add_argument("slug"); s.add_argument("id", nargs="?")
     s = sub.add_parser("open"); s.add_argument("slug")
     sub.add_parser("list"); sub.add_parser("serve")
     a = ap.parse_args(argv)
@@ -319,6 +368,8 @@ def main(argv=None, out=print):
         card = {"id": a.id, "title": a.title, "kind": a.kind, "t": time.time()}
         if a.kind == "derivation":
             card["lines"] = json.loads(raw)  # [{"l": "latex", "why": "texte"}]
+        elif a.kind == "qcm":
+            card["qcm"] = check_qcm(json.loads(raw))
         elif a.kind == "demo":
             card["demo"] = json.loads(raw)
             for st_ in card["demo"]["steps"]:   # pré-génère l'audio pour éviter l'attente
@@ -415,11 +466,17 @@ def main(argv=None, out=print):
         st["cmd"] = {"id": a.id, "action": "step", "k": a.k, "n": n}
         if a.id not in st["main"]:
             focus(a.id)
+    elif a.cmd == "qcm":
+        for line in qcm_txt(data, a.id):
+            out(line)
+        return
     elif a.cmd == "state":
         out(f"mise en page : {st['layout']} ; au centre : {st['main']} ; ouvertes : {st['pinned']}")
         out(marks_txt(st))
         for c in data["cards"]:
             out(f"  {c['id']}\t[{c['kind']}]\t{c['title']}\t(étape {c['step']})")
+        for line in qcm_txt(data, None, short=True):
+            out(line)
         return
 
     save(a.slug, data)

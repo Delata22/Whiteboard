@@ -1021,6 +1021,7 @@ class Prof:
         self.pending_images = []        # [(chemin, media_type, base64)] à joindre au prochain message   # mode silencieux, mémorisé par board
         self.mode_notice = ""                  # repères en attente d'une phrase
         self.scene_errors = []                 # erreurs affichées dans une scène chez l'élève, pour le prochain message
+        self.qcm_notice = ""                   # bilan d'un QCM fini au tableau, pour le prochain message
         self.started = False
 
     async def send(self, obj):
@@ -1053,6 +1054,8 @@ class Prof:
             msg = ("[Erreur affichée dans une scène du tableau, chez l'élève (tu ne vois pas son écran) : "
                    + " ; ".join(self.scene_errors) + ". Corrige la scène.]\n" + msg)
             self.scene_errors = []
+        if self.qcm_notice:             # QCM fini au tableau depuis le dernier message
+            msg, self.qcm_notice = f"[Il vient de finir un QCM au tableau : {self.qcm_notice}]\n" + msg, ""
         if self.mode_notice:            # bascule voix / silencieux depuis le dernier message
             msg, self.mode_notice = self.mode_notice + "\n" + msg, ""
         if self.interrupted is not None:
@@ -1243,7 +1246,7 @@ class Prof:
         """Ce que l'élève montre au tableau (sélection à la souris dans une carte) : (préfixe pour le prof,
         rappel court pour la page). La sélection est effacée une fois envoyée, pour ne pas coller aux suivantes."""
         try:
-            sel = json.loads((CAHIER.parent / "sessions" / self.a.slug / "cahier.json").read_text())["state"].get("selection")
+            sel = json.loads((DATA / "sessions" / self.a.slug / "cahier.json").read_text())["state"].get("selection")
         except (OSError, ValueError, KeyError):
             return "", None
         if not sel or not sel.get("id"):
@@ -1755,6 +1758,16 @@ class Prof:
                     log("page :", str(j.get("msg", ""))[:300])
                 elif j["t"] == "miclat":         # délai entre l'appui sur espace et le 1er son du micro
                     log(f"micro prêt en {j.get('ms')} ms ({j.get('mic', '')})")
+                elif j["t"] == "qcm":            # QCM fini au tableau (le score est déjà enregistré par le tableau)
+                    summary = str(j.get("summary", ""))[:4000]
+                    log("QCM fini :", summary[:200])
+                    if j.get("discuss"):         # « En parler avec le prof » : il débriefe tout de suite
+                        self.qcm_notice = ""
+                        await self.send({"t": "user", "text": "J'ai fini le QCM, on en parle ?", "shows": None, "images": []})
+                        await self.question("J'ai fini le QCM, on en parle ?",
+                                            prefix=f"[Résultat du QCM qu'il vient de faire au tableau : {summary}]\n")
+                    else:
+                        self.qcm_notice = summary
                 elif j["t"] == "scene_error":    # une scène du tableau a affiché une erreur chez l'élève
                     e = (f"« {j.get('scene')} » : " if j.get("scene") else "") + j.get("text", "")
                     log("erreur dans une scène :", e)
