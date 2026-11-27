@@ -593,7 +593,8 @@ class Brain:
         # Le cahier, la prononciation et ses cartes restent pré-autorisés (le tableau ne doit jamais attendre).
         allowed = [f"Bash(python3 {CAHIER}:*)", "Bash(python3 ~/.claude/cahier/cahier.py:*)", "Edit(./cards/**)",
                    "Read(./vocab.txt)", "Edit(./vocab.txt)", f"Bash(python3 {HERE / 'pron.py'}:*)",
-                   f"Bash(python3 {HERE / 'scene.py'}:*)", "Read", "Glob", "Grep"]
+                   f"Bash(python3 {HERE / 'scene.py'}:*)", "Read", "Glob", "Grep",
+                   "Edit(~/.claude/niveau/**)", "Write(~/.claude/niveau/**)"]
         args = [self.exe, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
                 "--verbose", "--include-partial-messages",
                 "--setting-sources", "user",            # ses instructions globales, sa mémoire, ses hooks
@@ -855,7 +856,8 @@ class CodexBrain(Brain):
                 "--sandbox", os.environ.get("PROF_CODEX_SANDBOX", "workspace-write"),
                 "-c", "sandbox_workspace_write.network_access=true",
                 "-c", f'model_reasoning_effort="{self.effort}"',
-                "--add-dir", str(CAHIER.parent), "--add-dir", str(DATA)]
+                "--add-dir", str(CAHIER.parent), "--add-dir", str(DATA),
+                "--add-dir", str(Path.home() / ".claude/niveau")]
         if self.codex_model:
             args += ["--model", self.codex_model]
         for f in imgs:
